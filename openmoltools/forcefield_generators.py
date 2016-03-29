@@ -116,6 +116,7 @@ def generateOEMolFromTopologyResidue(residue, geometry=False, tripos_atom_names=
     for atom in residue.atoms():
         oeatom = molecule.NewAtom(atom.element.atomic_number)
         oeatom.SetName(atom.name)
+        oeatom.AddData("topology_index", atom.index)
     oeatoms = { oeatom.GetName() : oeatom for oeatom in molecule.GetAtoms() }
     for (atom1, atom2) in residue.bonds():
         order = 1
@@ -138,7 +139,7 @@ def generateOEMolFromTopologyResidue(residue, geometry=False, tripos_atom_names=
     [status, output] = getstatusoutput(command)
 
     # Define mapping from GAFF bond orders to OpenEye bond orders.
-    order_map = { 1 : 1, 2 : 2, 3: 3, 7 : 1, 8: 2, 9 : 5, 10 : 5 }
+    order_map = { 1 : 1, 2 : 2, 3: 3, 7 : 1, 8 : 2, 9 : 5, 10 : 5 }
     # Read bonds.
     infile = open(ac_output_filename)
     lines = infile.readlines()
@@ -148,18 +149,19 @@ def generateOEMolFromTopologyResidue(residue, geometry=False, tripos_atom_names=
         elements = line.split()
         if elements[0] == 'BOND':
             antechamber_bond_types.append(int(elements[4]))
+    oechem.OEClearAromaticFlags(molecule)
     for (bond, antechamber_bond_type) in zip(molecule.GetBonds(), antechamber_bond_types):
-        bond.SetOrder(order_map[antechamber_bond_type])
+        #bond.SetOrder(order_map[antechamber_bond_type])
+        bond.SetIntType(order_map[antechamber_bond_type])
+    oechem.OEFindRingAtomsAndBonds(molecule)
+    oechem.OEKekulize(molecule)
+    oechem.OEAssignFormalCharges(molecule)
+    oechem.OEAssignAromaticFlags(molecule, oechem.OEAroModelOpenEye)
 
     # Clean up.
     os.unlink(mol2_input_filename)
     os.unlink(ac_output_filename)
     os.rmdir(tmpdir)
-
-    # Set aromaticity.
-    # TODO: Is this necessary?
-    oechem.OEClearAromaticFlags(molecule)
-    oechem.OEAssignAromaticFlags(molecule, oechem.OEAroModelOpenEye)
 
     # Generate Tripos atom names if requested.
     if tripos_atom_names:
@@ -259,6 +261,9 @@ def generateResidueTemplate(molecule, residue_atoms=None):
     # Generate canonical AM1-BCC charges and a reference conformation.
     molecule = get_charges(molecule, strictStereo=False, keep_confs=1)
 
+    # DEBUG: This may be necessary.
+    molecule.SetTitle('MOL')
+
     # Create temporary directory for running antechamber.
     import tempfile
     tmpdir = tempfile.mkdtemp()
@@ -326,7 +331,7 @@ def generateResidueTemplate(molecule, residue_atoms=None):
 
     return template, ffxml.getvalue()
 
-def generateForceFieldFromMolecules(molecules):
+def generateForceFieldFromMolecules(molecules, ignoreFailures=False):
     """
     Generate ffxml file containing additional parameters and residue templates for simtk.openmm.app.ForceField using GAFF/AM1-BCC.
 
@@ -340,10 +345,17 @@ def generateForceFieldFromMolecules(molecules):
         Net charge will be inferred from the net formal charge on each molecule.
         Partial charges will be determined automatically using oequacpac and canonical AM1-BCC charging rules.
 
+    ignoreFailures: boolean, default False
+        Whether to add a failed molecule to the list of failed molecules (True),
+        or raise an Exception (False).
+
     Returns
     -------
     ffxml : str
         Contents of ForceField `ffxml` file defining additional parameters from parmchk(2) and residue templates.
+    failed_molecule_list : list of openeye.oechem.OEMol
+        List of the oemols that could not be parameterized. Only returned if ignoreFailures=True
+
 
     Notes
     -----
@@ -368,6 +380,7 @@ def generateForceFieldFromMolecules(molecules):
     olddir = os.getcwd()
     os.chdir(tmpdir)
     leaprc = ""
+    failed_molecule_list = []
     for (molecule_index, molecule) in enumerate(molecules):
         # Set the template name based on the molecule title.
         template_name = molecule.GetTitle()
@@ -379,7 +392,13 @@ def generateForceFieldFromMolecules(molecules):
         net_charge = _computeNetCharge(molecule)
 
         # Generate canonical AM1-BCC charges and a reference conformation.
-        molecule = get_charges(molecule, strictStereo=False, keep_confs=1)
+        if not ignoreFailures:
+            molecule = get_charges(molecule, strictStereo=False, keep_confs=1)
+        else:
+            try:
+                molecule = get_charges(molecule, strictStereo=False, keep_confs=1)
+            except:
+                failed_molecule_list.append(molecule)
 
         # Create a unique prefix.
         prefix = 'molecule%010d' % molecule_index
@@ -409,7 +428,10 @@ def generateForceFieldFromMolecules(molecules):
     # TODO: Clean up temporary directory.
     os.chdir(olddir)
 
-    return ffxml.getvalue()
+    if ignoreFailures:
+        return ffxml.getvalue(), failed_molecule_list
+    else:
+        return ffxml.getvalue()
 
 def createStructureFromResidue(residue):
     # Create ParmEd structure for residue.
@@ -470,3 +492,70 @@ def gaffTemplateGenerator(forcefield, residue, structure=None):
 
     # Signal that we have successfully parameterized the residue.
     return True
+
+class SystemGenerator(object):
+    """
+    Utility factory to generate OpenMM Systems from Topology objects.
+
+    Parameters
+    ----------
+    forcefields_to_use : list of string
+        List of the names of ffxml files that will be used in system creation.
+    forcefield_kwargs : dict of arguments to createSystem, optional
+        Allows specification of various aspects of system creation.
+    use_gaff : bool, optional, default=True
+        If True, will add the GAFF residue template generator.
+
+    Examples
+    --------
+    >>> from simtk.openmm import app
+    >>> forcefield_kwargs={ 'nonbondedMethod' : app.NoCutoff, 'implicitSolvent' : None, 'constraints' : None }
+    >>> system_generator = SystemGenerator(['amber99sbildn.xml'], forcefield_kwargs=forcefield_kwargs)
+    >>> from openmmtools.testsystems import AlanineDipeptideVacuum
+    >>> testsystem = AlanineDipeptideVacuum()
+    >>> system = system_generator.createSystem(testsystem.topology)
+    """
+
+    def __init__(self, forcefields_to_use, forcefield_kwargs=None, use_gaff=True):
+        self._forcefield_xmls = forcefields_to_use
+        self._forcefield_kwargs = forcefield_kwargs if forcefield_kwargs is not None else {}
+        from simtk.openmm.app import ForceField
+        self._forcefield = ForceField(*self._forcefield_xmls)
+        if use_gaff:
+            self._forcefield.registerTemplateGenerator(gaffTemplateGenerator)
+
+    def getForceField(self):
+        """
+        Return the associated ForceField object.
+
+        Returns
+        -------
+        forcefield : simtk.openmm.app.ForceField
+            The current ForceField object.
+        """
+        return self._forcefield
+
+    def createSystem(self, topology):
+        """
+        Build a system from specified topology object.
+
+        Parameters
+        ----------
+        topology : simtk.openmm.app.Topology object
+            The topology of the system to construct.
+
+        Returns
+        -------
+        system : openmm.System
+            A system object generated from the topology
+        """
+        system = self._forcefield.createSystem(topology, **self._forcefield_kwargs)
+        return system
+
+    @property
+    def ffxmls(self):
+        return self._forcefield_xmls
+
+    @property
+    def forcefield(self):
+        return self._forcefield

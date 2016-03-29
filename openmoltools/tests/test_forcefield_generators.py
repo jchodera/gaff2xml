@@ -6,7 +6,7 @@ import os, sys
 import numpy as np
 from openmoltools import utils, forcefield_generators
 from simtk import openmm, unit
-from simtk.openmm.app import ForceField, NoCutoff
+from simtk.openmm.app import ForceField, NoCutoff, CutoffPeriodic, OBC2
 if sys.version_info >= (3, 0):
     from io import StringIO
 else:
@@ -321,6 +321,74 @@ def test_gaffResidueTemplateGenerator():
     system = forcefield.createSystem(pdb.topology, nonbondedMethod=NoCutoff)
     # Check potential is finite.
     check_potential_is_finite(system, pdb.positions)
+
+@skipIf(not HAVE_OE, "Cannot test openeye module without OpenEye tools.\n" + openeye_exception_message)
+def test_atom_topology_index():
+    """
+    Make sure that generateOEMolFromTopologyResidue adds the topology_index data
+    """
+    # Create a test set of molecules.
+    molecules = [ createOEMolFromIUPAC(name) for name in IUPAC_molecule_names ]
+    from openmoltools.forcefield_generators import generateTopologyFromOEMol, generateOEMolFromTopologyResidue
+    topologies = [generateTopologyFromOEMol(molecule) for molecule in molecules]
+    for topology in topologies:
+        residue = list(topology.residues())[0] #there is only one residue
+        regenerated_mol = generateOEMolFromTopologyResidue(residue)
+        for i, top_atom in enumerate(topology.atoms()):
+            oeatom = regenerated_mol.GetAtom(oechem.OEHasAtomIdx(top_atom.index))
+            assert oeatom.GetData("topology_index")==top_atom.index
+
+
+def check_system_generator(ffxmls, forcefield_kwargs, system_name, **kwargs):
+    """
+    Check SystemGenerator on a specific topology.
+    """
+    import openmmtools
+    try:
+        constructor = getattr(openmmtools.testsystems, system_name)
+        testsystem = constructor()
+        topology = testsystem.topology
+    except AttributeError:
+        if not HAVE_OE:
+            from nose.plugins.skip import SkipTest
+            raise SkipTest('Cannot test openeye module without OpenEye tools.\n')
+        molecule = createOEMolFromIUPAC(system_name)
+        topology = forcefield_generators.generateTopologyFromOEMol(molecule)
+    system_generator = forcefield_generators.SystemGenerator(ffxmls,
+                                                     forcefield_kwargs=forcefield_kwargs, **kwargs)
+    system_generator.createSystem(topology)
+
+
+def test_system_generator():
+    """
+    Test SystemGenerator.
+    """
+    from functools import partial
+    # Vacuum tests.
+    ffxmls = ['amber99sbildn.xml']
+    forcefield_kwargs = {'nonbondedMethod': NoCutoff, 'implicitSolvent': None, 'constraints': None}
+    for testsystem_name in ['AlanineDipeptideVacuum']:
+        f = partial(check_system_generator, ffxmls, forcefield_kwargs, testsystem_name)
+        f.description = 'Testing SystemGenerator on %s' % testsystem_name
+        yield f
+
+    # Implicit solvent tests.
+    ffxmls = ['amber99sbildn.xml', 'amber99_obc.xml']
+    forcefield_kwargs = {'nonbondedMethod': NoCutoff, 'implicitSolvent': OBC2, 'constraints': None}
+    for testsystem_name in ['AlanineDipeptideImplicit']:
+        f = partial(check_system_generator, ffxmls, forcefield_kwargs, testsystem_name)
+        f.description = 'Testing SystemGenerator on %s' % testsystem_name
+        yield f
+
+    # Small molecule tests.
+    gaff_xml_filename = utils.get_data_filename("parameters/gaff.xml")
+    ffxmls = [gaff_xml_filename]
+    forcefield_kwargs = {'nonbondedMethod': NoCutoff, 'implicitSolvent': None, 'constraints': None}
+    for name in IUPAC_molecule_names:
+        f = partial(check_system_generator, ffxmls, forcefield_kwargs, name, use_gaff=True)
+        f.description = 'Testing SystemGenerator on %s' % name
+        yield f
+
 
 if __name__ == '__main__':
     #test_PerceiveBondOrdersExplicitHydrogens(write_pdf=True)
